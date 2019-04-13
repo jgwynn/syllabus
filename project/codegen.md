@@ -60,12 +60,19 @@ There are convenience macros for these offsets:
 
 `visitFuncDecl`
 
-- Prologue (before emitting code for the block)
+The function's address in the symbol table is the index into the code array.
+
+`current_scope` is updated to record the current scope to look up variables in the symbol table.  Set and restore this variable to the `scope` field of the FuncDecl AST node as you traverse the tree.
+
+- Prologue (before emitting code for the function body)
 
   - emit a push for the link register (r14), i.e., return address, `psh r14 r13`
   - emit a push for the old frame pointer (r12), `psh r12 r13`
   - update the frame pointer to be the current stack pointer, `mov r12 r13`
-  - add space for the local variables, i.e., advance the stack pointer by one for each variable
+  - (done via `visitBlock`, not in `visitFuncDecl`) add space for the local variables, i.e., advance the stack pointer by one for each variable
+    - locals are done by `visitVarDecls` via `visitBlock`, so that function should emit `addi sp sp 1` for each one
+
+- Call `visitFormals` and `visitBlock` between prologue and epilogue
 
 - Epilogue (after emitting code for the block)
 
@@ -76,7 +83,7 @@ There are convenience macros for these offsets:
 
 `visitFormals`
 
-- Addresses of parameters
+- The addresses parameters are relative offsets from the fp, i.e., only store the offset, not the absolute address (which is not knowable at compile-time)
 
   - These are allocated and stored by the caller, so we only need to set their addresses
   - Each parameters is a fixed distance from the frame pointer
@@ -94,33 +101,52 @@ There are convenience macros for these offsets:
 `visitVarDecls`
 
 - loop through the variables (skeleton code for iterating over the list is given)
-- get the symbol for each variable
+- get the symbol (`cur->node->symbol`) for each variable
 - set the address for each variable (`symbol->address`), which is the offset from the frame pointer.  variables appear one after another starting from `OFFSET_FIRST_LOCAL`.
   - e.g., if there are three local variables, `x` and `y`, `x` has
     offset 1 while `y` has offset 2 and so on for more locals.
+- emit `addi sp sp 1` for each variable for the prologue
 
 `visitReturnStatement`
 
 - Recall that the caller pushed the return address to `FP - 3`
+- visit the expression using its ershov number minus 1 (the initial register base)
 - move the register holding the return expression to the stack at that offset
 - emit the epilogue
 
 ##### Caller Setup
 
-`setupFunctionCall` is used both `visitCallStatement` and `visitFunctionFactor` to prepare the stack for the call
+`setupFunctionCall` is used by both `visitCallStatement` and `visitFunctionFactor` to prepare the stack for the call.
 
-- (`visitFunctionFactor` only) emit pushes for any registers that hold
+- note that your compiler doesn't track the stack pointer, rather it emits code that increments/decrements the pointer in well-defined fixed amounts, i.e., the stack frame size.
+- `
+visitFunctionFactor` (given) emits pushes for any registers that hold
   temp values (r0-r#), all registers before `reg_base`.
-  `visitCallStatement` doesn't need tod o this because it doesn't use
+  `visitCallStatement` doesn't need to do this because it doesn't use
   any registers itself.
-
+m
         push r0 sp
         push r1 sp
         ...
 
-- allocate space on the stack for all the parameters
+`setupFunctionCall` does the following:
+
+- allocate space on the stack for all the parameters (if there are any)
   - use the `list->size` to move the stack pointer `addi sp sp size`, where size is `list->size`
-- evaluate `visitExpressionList`
+- run `visitExpression` for each expression element.  evaluate these one-at-a-time and immediately store them onto the stack.  that will obviate the need to hold values in registers.
+
+        struct ExpressionListElement *cur = parameters->head;
+        int i = 0;
+        while (NULL != cur) {
+          // TODO: visit the expression and record the resulting register
+          // TODO: emit a store into the stack frame under the corresponding actual parameter slot
+          i++;
+    
+          cur = cur->next;
+        }
+
+
+
   - use `SP - i` to access the ith parameter
   - emit code for each expression
   - then emit a sto for the resulting value of each expression
@@ -146,7 +172,6 @@ There are convenience macros for these offsets:
             psh r0 sp 
    
 - emit `bl disp`, where `disp` is the current IP (r15) minus the address of function (from symbol table)
-- emit the function
 - emit pops for the register values stored by the prologue (in reverse order!)
 
 #### Variable Access
@@ -158,13 +183,11 @@ There are convenience macros for these offsets:
   - If it's in the current scope, load the variable's value into the register given by `reg_base`.  The load takes some base register plus an offset immediate value.  The base address in this case is the frame pointer, whereas the offset is the address for the variable (`symbol->address`) computed when visiting the function declaration.
   - If the scope is an ancestor (level of symbol is lower than current scope), then we need to emit code that follows the static link N times, where N is the difference in nesting depth, i.e., the difference between the levels.  Save the current frame pointer, and keep loading the static link to the parent's stack frame into FP.  Then store the value into the same register and restore FP.  Recall that the static link can be found at `FP - 2`.
   
-            psh fp, sp      # save the current FP
-            ld fp, fp, -2   # N=1, fp holds the static parent frame pointer
-            ld fp, fp, -2   # N=2, fp holds the static parent's parent's frame pointer
-            ld fp, fp, -2   # etc
-            ...
-            ld r#, fp, off  # finally load the variables new value r# (reg_base) into its palce on the stack, i.e., the offset symbol->address from the ancestor stack frame found
-            pop fp, sp      # restore the current FP
+            mov r# fp       # store the current fp into the given reg_base r#
+            ld r#, r#, -2   # get the parent's frame pointer
+            ld r#, r#, -2   # get the parent's parent's frame pointer
+            ...             # etc
+            ld r#, r#, off  # finally load the variables new value r# (reg_base) into its palce on the stack, i.e., the offset symbol->address from the ancestor stack frame found
 
 
 `setVariable(struct Symbol *symbol, int reg);` and `visitAssignStatement(struct Statement *node);`
@@ -256,7 +279,6 @@ Here is the algorithm for choosing registers:
 
 _Don't forget to return the resulting register number from each expression visitor!_
 
-
 #### Boolean Expressions
 
 Computing operations on Boolean expressions is very different from
@@ -330,9 +352,7 @@ check each operand one-at-a-time.  `or` is similar, but instead if either operan
 - Generating correct control flow and store instructions
 - Tested with writes of integer constants
 
-Statements can always given 0 for the reg_base (or any other
-general-purpose register), since statements require no temporary
-values.
+_For all statements (except read) that use expressions, give `ershov - 1` as the initial `reg_base`.  For the read statement, you can just use register `0`, since no expression is being evaluated._
 
 `static void visitIfStatement(struct Statement *node);`
 
@@ -366,6 +386,9 @@ and it's equivalent VM code:
     bne 4
     movi r0 1
     wr r0
+    br 1
+    
+ 
 
 
 
@@ -387,3 +410,7 @@ and it's equivalent VM code:
 
 This is just like an if statement, but with an extra jump back to the
 condition evaluation.
+
+`static void visitReadStatement(struct Statement *node);`
+
+- be sure to use setVariable
